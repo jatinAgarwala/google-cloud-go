@@ -478,9 +478,7 @@ func (a *agent) profileAndUpload(ctx context.Context, p *pb.Profile) {
 		} else {
 			debugLog("BigQuery client/config not set for table %s, skipping BQ upload.", a.bqDenormTableID)
 		}
-	}
-
-	if !config.EnableBigQuery {
+	} else {
 		req := pb.UpdateProfileRequest{Profile: p}
 
 		// Upload profile, discard profile in case of error.

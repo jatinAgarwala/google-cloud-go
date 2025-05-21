@@ -632,7 +632,8 @@ func initializeConfig(cfg Config) error {
 		}
 	}
 	if config.Service == "" {
-		return errors.New("service name must be configured")
+		debugLog("service name not specified in the configuration. Using default value 'profiler-agent'")
+		config.Service = "profiler-agent"
 	}
 	if !serviceRegexp.MatchString(config.Service) {
 		return fmt.Errorf("service name %q does not match regular expression %v", config.Service, serviceRegexp)
@@ -690,10 +691,12 @@ func initializeConfig(cfg Config) error {
 
 	if config.EnableBigQuery {
 		if config.BqDatasetID == "" {
-			return fmt.Errorf("bigQuery dataset ID must be specified in the configuration if uploading to BigQuery is enabled")
+			debugLog("bigQuery dataset ID not specified in the configuration. Using default value 'profiler_data'")
+			config.BqDatasetID = "profiler_data"
 		}
 		if config.BqTableID == "" {
-			return fmt.Errorf("bigQuery table ID must be specified in the configuration if uploading to BigQuery is enabled")
+			debugLog("bigQuery table ID not specified in the configuration. Using default value 'profiler_denormalized_data'")
+			config.BqTableID = "profiler_denormalized_data"
 		}
 		if config.BqUploadTimeout <= 0 {
 			debugLog("Setting upload timeout for BigQuery as 30 seconds (default)")

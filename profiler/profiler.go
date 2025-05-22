@@ -32,6 +32,7 @@
 // profiling can be enabled in the config. Note that goroutine and mutex
 // profiles are shown as "threads" and "contention" profiles in the profiler
 // UI.
+
 package profiler
 
 import (
@@ -49,6 +50,7 @@ import (
 	"sync"
 	"time"
 
+	"cloud.google.com/go/bigquery"
 	gcemd "cloud.google.com/go/compute/metadata"
 	"cloud.google.com/go/internal/version"
 	"cloud.google.com/go/profiler/internal"
@@ -63,6 +65,8 @@ import (
 	grpcmd "google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
+	_ "google.golang.org/protobuf/types/known/durationpb"
+	_ "google.golang.org/protobuf/types/known/timestamppb"
 )
 
 var (
@@ -190,6 +194,19 @@ type Config struct {
 	// the profile collection loop exits.When numProfiles is 0, profiles will
 	// be collected for the duration of the program. For testing only.
 	numProfiles int
+
+	// boolean that can be set true to upload to BigQuery. Uploads to GCE automatically get disabled if BigQuery uploads are enabled
+	// Defaults to false
+	EnableBigQuery bool
+
+	// DatasetID of BigQuery, required if EnableBigQuery is true
+	BqDatasetID string
+
+	// TableID of BigQuery, required if EnableBigQuery is true
+	BqTableID string
+
+	// Timeout duration for BigQuery uploads. Defaults to 30 seconds
+	BqUploadTimeout time.Duration
 }
 
 // allowUntilSuccess is an object that will perform action till
@@ -279,10 +296,13 @@ func debugLog(format string, e ...interface{}) {
 // agent polls the profiler server for instructions on behalf of a task,
 // and collects and uploads profiles as requested.
 type agent struct {
-	client        pb.ProfilerServiceClient
-	deployment    *pb.Deployment
-	profileLabels map[string]string
-	profileTypes  []pb.ProfileType
+	client          pb.ProfilerServiceClient
+	deployment      *pb.Deployment
+	profileLabels   map[string]string
+	profileTypes    []pb.ProfileType
+	bqClient        *bigquery.Client
+	bqDatasetID     string
+	bqDenormTableID string
 }
 
 // abortedBackoffDuration retrieves the retry duration from gRPC trailing
@@ -365,7 +385,9 @@ func (a *agent) createProfile(ctx context.Context) *pb.Profile {
 	return p
 }
 
+// profileAndUpload generates the profile, uploads to BQ (async), and uploads to Profiler API.
 func (a *agent) profileAndUpload(ctx context.Context, p *pb.Profile) {
+	uploadTime := time.Now().UTC() // Capture time for BQ record
 	var prof bytes.Buffer
 	pt := p.GetProfileType()
 
@@ -379,6 +401,30 @@ func (a *agent) profileAndUpload(ctx context.Context, p *pb.Profile) {
 
 	if !ptEnabled {
 		debugLog("skipping collection of disabled profile type: %v", pt)
+		return
+	}
+
+	// --- Profile Generation ---
+	var profileGenErr error
+	// var profileDuration time.Duration
+	protoDuration := p.GetDuration()
+	if protoDuration != nil {
+		if err := protoDuration.CheckValid(); err != nil {
+			debugLog("invalid duration format for profile type %v: %v", pt, err)
+		} else {
+			profileDuration := protoDuration.AsDuration()
+			if profileDuration <= 0 && (pt == pb.ProfileType_CPU || pt == pb.ProfileType_HEAP_ALLOC || pt == pb.ProfileType_CONTENTION) {
+				profileGenErr = fmt.Errorf("non-positive duration (%v) for profile type %v", profileDuration, pt)
+				debugLog(profileGenErr.Error())
+			}
+		}
+	} else if pt == pb.ProfileType_CPU || pt == pb.ProfileType_HEAP_ALLOC || pt == pb.ProfileType_CONTENTION {
+		profileGenErr = fmt.Errorf("missing duration for profile type %v", pt)
+		debugLog(profileGenErr.Error())
+	}
+
+	if profileGenErr != nil {
+		debugLog("Profile generation failed for type %v: %v. Skipping uploads.", pt, profileGenErr)
 		return
 	}
 
@@ -420,12 +466,26 @@ func (a *agent) profileAndUpload(ctx context.Context, p *pb.Profile) {
 
 	p.ProfileBytes = prof.Bytes()
 	p.Labels = a.profileLabels
-	req := pb.UpdateProfileRequest{Profile: p}
 
-	// Upload profile, discard profile in case of error.
-	debugLog("start uploading profile")
-	if _, err := a.client.UpdateProfile(ctx, &req); err != nil {
-		debugLog("failed to upload profile: %v", err)
+	if len(p.ProfileBytes) == 0 {
+		debugLog("Profile generation resulted in empty bytes for type %v. Skipping uploads.", pt)
+		return
+	}
+
+	if config.EnableBigQuery {
+		if a.bqClient != nil && a.bqDatasetID != "" && a.bqDenormTableID != "" && a.deployment.ProjectId != "" {
+			go a.parseAndUploadToBigQuery(ctx, pt.String(), uploadTime, p.ProfileBytes)
+		} else {
+			debugLog("BigQuery client/config not set for table %s, skipping BQ upload.", a.bqDenormTableID)
+		}
+	} else {
+		req := pb.UpdateProfileRequest{Profile: p}
+
+		// Upload profile, discard profile in case of error.
+		debugLog("start uploading profile")
+		if _, err := a.client.UpdateProfile(ctx, &req); err != nil {
+			debugLog("failed to upload profile: %v", err)
+		}
 	}
 }
 
@@ -523,11 +583,40 @@ func initializeAgent(c pb.ProfilerServiceClient) (*agent, error) {
 		return nil, fmt.Errorf("collection is not enabled for any profile types")
 	}
 
+	var bqClient *bigquery.Client
+	var bqErr error
+
+	var bqDatasetID string
+	var bqDenormTableID string
+	if config.EnableBigQuery {
+
+		if config.ProjectID == "" {
+			log.Println("Cloud Profiler: Warning: ProjectID is empty. BigQuery uploads will be disabled.")
+			bqClient = nil
+		} else {
+			bqClient, bqErr = bigquery.NewClient(context.Background(), config.ProjectID)
+			if bqErr != nil {
+				log.Printf("Cloud Profiler: Warning: Failed to initialize BigQuery client for project %s: %v. BigQuery uploads will be disabled.", config.ProjectID, bqErr)
+				bqClient = nil
+			} else {
+				debugLog("BigQuery client initialized successfully for project %s.", config.ProjectID)
+			}
+		}
+		bqDatasetID = config.BqDatasetID
+		bqDenormTableID = config.BqTableID
+	} else {
+		bqDatasetID = ""
+		bqDenormTableID = ""
+	}
+
 	return &agent{
-		client:        c,
-		deployment:    d,
-		profileLabels: profileLabels,
-		profileTypes:  profileTypes,
+		client:          c,
+		deployment:      d,
+		profileLabels:   profileLabels,
+		profileTypes:    profileTypes,
+		bqClient:        bqClient,
+		bqDatasetID:     bqDatasetID,
+		bqDenormTableID: bqDenormTableID,
 	}, nil
 }
 
@@ -543,7 +632,8 @@ func initializeConfig(cfg Config) error {
 		}
 	}
 	if config.Service == "" {
-		return errors.New("service name must be configured")
+		debugLog("service name not specified in the configuration. Using default value 'profiler-agent'")
+		config.Service = "profiler-agent"
 	}
 	if !serviceRegexp.MatchString(config.Service) {
 		return fmt.Errorf("service name %q does not match regular expression %v", config.Service, serviceRegexp)
@@ -598,6 +688,22 @@ func initializeConfig(cfg Config) error {
 	if config.APIAddr == "" {
 		config.APIAddr = apiAddress
 	}
+
+	if config.EnableBigQuery {
+		if config.BqDatasetID == "" {
+			debugLog("bigQuery dataset ID not specified in the configuration. Using default value 'profiler_data'")
+			config.BqDatasetID = "profiler_data"
+		}
+		if config.BqTableID == "" {
+			debugLog("bigQuery table ID not specified in the configuration. Using default value 'profiler_denormalized_data'")
+			config.BqTableID = "profiler_denormalized_data"
+		}
+		if config.BqUploadTimeout <= 0 {
+			debugLog("Setting upload timeout for BigQuery as 30 seconds (default)")
+			config.BqUploadTimeout = 30 * time.Second
+		}
+	}
+
 	return nil
 }
 
@@ -607,10 +713,49 @@ func initializeConfig(cfg Config) error {
 func pollProfilerService(ctx context.Context, a *agent) {
 	debugLog("Cloud Profiler Go Agent version: %s", internal.Version)
 	debugLog("profiler has started")
+
+	profileCount := 0
 	for i := 0; config.numProfiles == 0 || i < config.numProfiles; i++ {
+		if ctx.Err() != nil {
+			debugLog("Context cancelled before creating profile, exiting poll loop.")
+			break
+		}
+
 		p := a.createProfile(ctx)
+
+		if p == nil {
+			log.Printf("Cloud Profiler: Failed to create profile after retries. Continuing poll loop.")
+			select {
+			case <-time.After(initialBackoff):
+			case <-ctx.Done():
+				debugLog("Context cancelled during backoff sleep after createProfile failure.")
+				break // Exit inner select and outer loop check will catch cancellation
+			}
+		}
+
+		if ctx.Err() != nil {
+			debugLog("Context cancelled before uploading profile, exiting poll loop.")
+			break
+		}
+
 		a.profileAndUpload(ctx, p)
+		profileCount = i + 1
+
+		if ctx.Err() != nil {
+			debugLog("Context cancelled, exiting poll loop.")
+			break
+		}
 	}
+
+	if config.EnableBigQuery {
+		closeBqClient(a)
+	}
+
+	logMsg := "Profiler has stopped polling loop."
+	if config.numProfiles > 0 {
+		logMsg = fmt.Sprintf("Profiler has stopped polling loop after %d profiles.", profileCount)
+	}
+	debugLog(logMsg)
 
 	if profilingDone != nil {
 		profilingDone <- true
